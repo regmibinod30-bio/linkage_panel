@@ -1,0 +1,193 @@
+#!/bin/bash
+
+# ========================
+# linkage_marker_panel.pbs
+# ========================
+# This script is written to implement PLINK and interpolation.R for generating
+# linkage marker panel. The goal of the analysis is to obtain linkage
+# independent SNP panel within genomewide exome targets that were deployed for
+# exome sequencing. The linkage_marker_panel.pbs script runs PLINK program
+# for filtering minor alleles, and pruning the potentially linked SNP markers.
+# The embeded R script, interpolation.R captures markers physical position
+# that fall within the exome sequence fragments. R script does not requre to run
+# separately. Use the following command to run PBS script inside the script
+# directory:
+# ./linkage_marker_panel.pbs
+ 
+# Job script
+#PBS -S /bin/bash
+#PBS -l walltime=03:30:00
+#PBS -A PAS1004
+#PBS -N lp_HGRIC
+#PBS -e /dev/null
+#PBS -o /dev/null
+
+# Change to current working directory
+cd $PBS_O_WORKDIR
+
+# Verify that commands are being executed by a PBS job in a top-level
+# login shell
+if [ -z "$PBS_ENVIRONMENT" ] || [ $SHLVL -ne 1 ] || \
+    ! shopt -q login_shell; then
+    echo "Not being executed by a PBS job in a top-level login shell"
+    exit 1
+fi
+
+# Verify repo working directory is clean and the current head is capturing
+# the state
+GIT_SHA1=$(git rev-parse HEAD)
+if [ -n "$(git status --porcelain)" ]; then
+    echo "Working directory or index is dirty"
+    exit 1
+fi
+
+# Create output directory and redirect log file to the directory
+LOGFILE=linkage_panel.log
+echo "Redirecting logging information to $LOGFILE"
+exec 3>&1 4>&2 1>$LOGFILE 2>&1
+
+# Print analysis start time
+echo "Analysis started $(date --rfc-3339=seconds)"
+
+# Set and print module environment
+echo "Loading required modules......"
+module load R/3.5.3 PLINK/1.90b6.13
+module list
+
+# Population of interest
+# POP is hard coded in this script. This can be switched as
+# of population of interest.
+POP1='GBR'
+POP2='CEU'
+SCRIPT=linkage_marker_panel.pbs
+
+# SNPs genotypes (1000Genome) VCF file download from NCBI site
+URL=ftp://ftp-trace.ncbi.nih.gov/
+DIR=1000genomes/ftp/release/20130502/supporting/hd_genotype_chip/
+FILE=ALL.chip.omni_broad_sanger_combined.20140818.snps.genotypes.vcf.gz
+
+# Check, and if the file exits, download it
+# Download the file, unzip and save in the input directory
+if [[ ! $(wget --spider $URL$DIR$FILE 2>/dev/null) ]]; then
+     echo "===Downloading VCF File==="
+     # Download VCF file
+     wget -q $URL$DIR$FILE -P ../input/
+     cd ../input
+     gunzip -f *.snps.genotypes.vcf.gz
+     mv -f *.snps.genotypes.vcf genotypes.vcf
+     cd $PBS_O_WORKDIR
+     echo "===Download completed==="
+else
+     echo "Incorrect file name or URL"
+     exit 1
+fi
+
+# Files and directories
+INPUT_VCF='../input/genotypes.vcf'
+IGSR_INPUT='../input/1000_Genome_unrelSamples.txt'
+EXOME_TARGET='../input/nimblegen_solution_V2refseq2010.HG19.list'
+rutgers_map='../input/rutgers_map'
+mkdir -p ../output
+OUTPUT='../output'
+mv -f $LOGFILE $OUTPUT/.
+echo -e "\n"
+
+# Analysis information
+echo "===ANALYSIS INFORMATION==="
+echo "Data Repo:        /fs/project/PAS1004/git_remotes/binod/legacy_linkage.git"
+echo "Current Commit:        $GIT_SHA1"
+echo "Software Version:        PLINK(1.90b6.13)"
+echo "Author:        Shaun Purcell, Christopher Chang"
+echo "Software Source:        https://www.cog-genomics.org/plink/"
+echo "Job Script:        --/$SCRIPT"
+echo "Working Copy:   $PBS_O_WORKDIR"
+echo "PBS Job ID:   $PBS_JOBID"
+echo -e "\n"
+echo "Input:"
+echo "       $INPUT_VCF"
+echo "       $EXOME_TARGET"
+echo "       $IGSR_INPUT"
+echo "       $rutgers_map"
+echo -e "\n"
+echo "Output:"
+echo "       $LOGFILE"
+echo "       Linkage_marker_panel"
+echo "       interpolation.Rout"
+echo -e "\n"
+
+# Extract the population of interest with family ID and individual ID
+# Here legacy POPs individual and family ID list of GBR and CEU are 
+# extracted. This list does not contain related individuals
+awk -v OFS=' ' '{ if ( $7~'/$POP1/' || $7~'/$POP2/' ) {print $1, $2}}'\
+    $IGSR_INPUT > pop.txt
+
+# Recode the VCF file into ped and map with prefix step1
+# Allow recoding noises in chromosome name field first, and later,
+# remove the noises  with --chr option. Filter out the minor alleles.
+plink --vcf $INPUT_VCF --maf 0.05 --recode --allow-extra-chr\
+     --chr 1-22 XY --out step1
+
+# Make a binary file
+plink --file step1 --make-bed --out step2
+
+# Extract the population of interest
+# Individual and family ID combination listed in pop.txt will be retained in VCF
+# for downstream analysis
+plink -bfile step2 --keep pop.txt --make-bed --out step3
+
+# Filter out HWE test significant variants
+echo "===Filtering Hardy_Weinberg Equilibrium markers==="
+plink --bfile step3 --hwe 0.001 --nonfounders --make-bed --out step4
+echo "=== Filtering HWE done ==="
+
+# Parse the exome target file with chr#, start and end coordinates
+awk -F ":|-" '{print $1, $2, $3}' $EXOME_TARGET > parsed_exome_target
+
+# Add fourth column (range_id) in exome_target file just to make
+# plink happy
+awk -v OFS=' ' '{print $1, $2, $3, $2}' parsed_exome_target > step5
+
+# Extract the variants that fall under the exome target fragments
+plink --bfile step4 --extract step5 --range --make-bed --out step6
+
+# Prune the LD SNPs (set length of sliding windows, shift_size of the
+# window and r-square value). 
+# It generates the prune.in file with map file
+# R-square is the multiple correlation coefficient between the SNP and all
+# other SNPs in the window based on allele count.
+plink --bfile step6 --indep-pairwise 50 5 0.5 --out step7
+
+# Extract  the data of pruned subset and make a binary file
+plink --bfile step6 --extract step7.prune.in --recode --out snpchips_pruned
+
+# Extract physical distance for the markers
+awk -v OFS='\t' '{print $2, $1, $4}' snpchips_pruned.map | sort -k 1\
+     > sorted_snpchips_pruned.map
+
+# Extract overlaped markers from rutgers_map
+join -1 1 -2 1 sorted_snpchips_pruned.map $rutgers_map > marker_genomic_distance
+
+# Fill in SNP marker's physical position in exome start and end target interval
+# This is a packrat R script, uses dplyr package 
+echo "===Capturing SNPs within exome target==="
+R CMD BATCH --vanilla --slave interpolation.R ../output/interpolation.Rout
+echo "===Capturing SNPs within exome target done==="
+
+# Join R output to original table to create final output
+awk -v OFS='\t' '{print $2, $1, $3, $5}' marker_genomic_distance\
+     | sort -n -k 3 > sorted_marker_genomic_distance
+awk -v OFS='\t' '{print $1, $2, $3}' rOutput | sort -n -k 1 > sorted_rOutput
+join -1 3 -2 1 sorted_marker_genomic_distance sorted_rOutput > final_output
+
+# Format the final output
+awk -v OFS='\t' 'BEGIN {print "Chr#   " "Marker_name  " "Physical_pos "\
+     "Exome_start  " "Exome_end    " "Genomic_dist(cM)  "}\
+     {print $2, $3, $1, $5, $6, $4}' final_output | sort -k 1 -n \
+     > $OUTPUT/Linkage_marker_panel
+
+# Final clean up
+rm -rf step* final_output sorted_snpchips_pruned.map
+rm -rf snpchips_pruned* pop.txt sorted_rOutput parsed_exome_target
+rm -rf sorted_marker_genomic_distance rOutput marker_genomic_distance
+rm -rf $INPUT_VCF
+echo "Job completed: $(date --rfc-3339=seconds)"
